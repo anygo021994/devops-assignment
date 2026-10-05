@@ -1,2 +1,11 @@
 subscription_id = "00000000-0000-0000-0000-000000000000"
 allowed_ip_cidr = "YOUR.PUBLIC.IP/32"
+
+# Configuration verified on a free subscription (4 vCPU quota):
+location       = "swedencentral"
+cp_vm_size     = "Standard_B2ls_v2"
+worker_vm_size = "Standard_B2ls_v2"
+worker_count   = 1
+
+# For the full topology (1 control plane + 2 workers) use worker_count = 2,
+# which needs enough vCPU quota for the chosen sizes.

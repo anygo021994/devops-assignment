@@ -8,13 +8,13 @@ A small Kubernetes environment built on Microsoft Azure with Terraform, running 
 Microsoft Azure
       |
       v
-Terraform  (Resource Group, VNet, Subnet, NSG, 3 VMs)
+Terraform  (Resource Group, VNet, Subnet, NSG, Linux VMs)
       |
       v
-3 Ubuntu 24.04 VMs  (10.0.1.10 / .11 / .12)
+Ubuntu 24.04 VMs  (10.0.1.10 = control plane, 10.0.1.11+ = workers)
       |
       v
-k3s Kubernetes cluster: 1 control plane + 2 workers
+k3s Kubernetes cluster: 1 control plane + N workers
       |
       v
 Argo CD  (installed in the cluster, namespace "argocd")
@@ -25,6 +25,8 @@ This Git repository  (path: kubernetes/)
       v
 nginx web application (2 replicas, NodePort 30080)
 ```
+
+The number of workers is a Terraform variable (`worker_count`, default `2`, as required by the assignment). The deployment that was actually executed and verified used `worker_count = 1`; see section 11 for the reason.
 
 | Component | Choice | Why |
 |---|---|---|
@@ -42,12 +44,13 @@ devops-assignment/
 ├── scripts/       cloud-init templates for the control plane and the workers
 ├── kubernetes/    Deployment and Service for the web application
 ├── argocd/        Argo CD Application that points at kubernetes/
+├── docs/          Screenshots of the verified deployment
 └── README.md
 ```
 
 ## 2. Prerequisites
 
-- An Azure subscription
+- An Azure subscription (a free account works, see the limitations about quota)
 - Azure CLI, Terraform >= 1.5, and kubectl installed locally
 - An SSH key pair: `ssh-keygen -t ed25519 -f ~/.ssh/lh_assignment`
 - Your public IP address (for example `curl ifconfig.me`)
@@ -61,21 +64,41 @@ az account show          # note the subscription id
 
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars: set subscription_id and allowed_ip_cidr (YOUR.IP/32)
+# edit terraform.tfvars (see the example file)
 
 terraform init
 terraform plan
 terraform apply
 ```
 
+Example `terraform.tfvars` for the configuration that was verified (free subscription, 4 vCPU limit):
+
+```hcl
+subscription_id = "<your subscription id>"
+allowed_ip_cidr = "<your public IP>/32"
+location        = "swedencentral"
+cp_vm_size      = "Standard_B2ls_v2"
+worker_vm_size  = "Standard_B2ls_v2"
+worker_count    = 1
+```
+
+For the full topology required by the assignment (1 control plane + 2 workers), set `worker_count = 2` (the default). This needs enough vCPU quota for the chosen sizes.
+
 Terraform creates:
 
 - 1 Resource Group
 - 1 Virtual Network (10.0.0.0/16) and 1 Subnet (10.0.1.0/24)
 - 1 Network Security Group attached to the subnet
-- 3 Public IPs, 3 NICs, and 3 Linux VMs (Ubuntu 24.04 LTS)
+- 1 Public IP, 1 NIC and 1 Linux VM (Ubuntu 24.04 LTS) per node
 
 VMs communicate over the internal Azure network. Azure's default `AllowVnetInBound` rule allows all traffic inside the VNet.
+
+Known provider issue: `terraform apply` can end with `Provider produced inconsistent result after apply ... Root object was present, but now absent` for the NSG or the subnet association. The resource does exist in Azure. Re-run `terraform apply`, or import it, for example:
+
+```bash
+terraform import azurerm_subnet_network_security_group_association.assoc \
+  "/subscriptions/<sub-id>/resourceGroups/rg-lh-assignment/providers/Microsoft.Network/virtualNetworks/vnet-k8s/subnets/snet-k8s"
+```
 
 ## 4. Kubernetes installation
 
@@ -126,6 +149,8 @@ terraform output app_url
 
 Open that URL (`http://<control-plane-public-ip>:30080`) in a browser. The NSG allows this port only from `allowed_ip_cidr`.
 
+![nginx served from the cluster](docs/screenshots/01-nginx.png)
+
 Argo CD UI (optional), from the control plane:
 
 ```bash
@@ -138,20 +163,29 @@ Then browse to `https://localhost:8080` (user `admin`).
 
 ## 9. Verifying the environment
 
-Allow about 5 minutes after `terraform apply` finishes. Then:
+Allow about 8 to 10 minutes after the VMs are created. Then:
 
 ```bash
-$(terraform output -raw ssh_command)
+ssh -i ~/.ssh/lh_assignment azureuser@<control-plane-ip>
 
-sudo k3s kubectl get nodes                        # 3 nodes, all Ready
-sudo k3s kubectl get pods -n argocd               # all Running
+sudo cloud-init status --wait                     # status: done
+sudo k3s kubectl get nodes                        # all nodes Ready
+sudo k3s kubectl get pods -A                      # all Running
 sudo k3s kubectl get application -n argocd        # web-app: Synced / Healthy
 sudo k3s kubectl get pods -n web-app -o wide      # 2 pods Running
 ```
 
 Troubleshooting: `sudo tail -f /var/log/cloud-init-output.log`
 
-GitOps check: change `replicas: 2` to `replicas: 3` in `kubernetes/deployment.yaml`, push to `main`, and Argo CD syncs the change automatically.
+Evidence from the executed deployment (Sweden Central, 1 control plane + 1 worker):
+
+![Nodes and pods](docs/screenshots/02-nodes-pods.png)
+
+![Argo CD application Synced and Healthy](docs/screenshots/03-argocd-synced.png)
+
+GitOps check: `replicas: 2` was changed to `replicas: 3` in `kubernetes/deployment.yaml` and pushed to `main`. Argo CD created the third pod within seconds of its next sync, with no manual `kubectl apply`. The value was then set back to 2 and Argo CD removed the extra pod.
+
+![Third replica created by Argo CD](docs/screenshots/04-gitops-3-replicas.png)
 
 ## 10. Destroying the resources
 
@@ -160,8 +194,26 @@ cd terraform
 terraform destroy
 ```
 
+If the provider issue from section 3 leaves the resource group undeletable, run `az group delete -n rg-lh-assignment --yes` and remove the local `terraform.tfstate*` files.
+
 ## 11. Assumptions and limitations
 
+**Why the verified deployment has 2 nodes instead of 3**
+
+The assignment asks for 1 control plane and 2 workers, and the code supports that (`worker_count = 2`, the default; `terraform plan` for the full 3-VM topology succeeded with 15 resources). The deployment that I executed on a free Azure subscription used 1 worker, because of capacity limits on that subscription:
+
+- The subscription has a limit of 4 vCPU per region.
+- `westeurope` rejected new resources for this subscription (`RequestDisallowedByAzure`, region not accepting new customers).
+- In `germanywestcentral`, `northeurope`, `swedencentral`, `polandcentral` and `uksouth`, VM sizes with 1 vCPU (and the B series in several regions) failed with `SkuNotAvailable` (capacity restrictions).
+- Only 2 vCPU sizes had capacity (for example `Standard_B2ls_v2` in `swedencentral`), and three of those need 6 vCPU, which is above the quota.
+- Therefore the largest cluster that fits is 1 control plane + 1 worker with 2 vCPU each (4 vCPU in total).
+
+Nothing else changes between the two topologies: the worker join logic is the same, and a second worker is added by setting `worker_count = 2` once the quota or capacity allows it (3 x 2 vCPU needs a quota of 6, or smaller worker sizes).
+
+Other notes:
+
+- Capacity and quotas in Azure change over time, so results in other subscriptions and regions may differ.
+- In k3s the control plane node is schedulable, so application pods can run on it as well (in the verified deployment one replica ran on `cp-1` and one on `worker-1`).
 - The repository is public so Argo CD can pull it without credentials. A private repo would need a deploy key or token.
 - The k3s join token is stored in VM custom data. In production it would come from Azure Key Vault.
 - All VMs have public IPs, restricted by the NSG to the admin IP. Production would use private nodes, a bastion host, and a NAT gateway.
@@ -169,10 +221,10 @@ terraform destroy
 - Terraform state is local. Production would use an Azure Storage backend with locking.
 - The application is HTTP only (NodePort), with no Ingress or TLS.
 - Argo CD and the image are pinned to versions. Check for newer releases before reuse.
-- The API server (6443) and SSH (22) are open only to `allowed_ip_cidr`. If your IP changes, update the variable and re-apply.
-- The region `westeurope` and VM size `Standard_B2s` can be changed in `terraform/variables.tf` if they are unavailable in a subscription.
+- The API server (6443), SSH (22) and the app (30080) are open only to `allowed_ip_cidr`. If your IP changes, update the variable and re-apply.
 
 ## Verification status
 
-- `terraform init` and `terraform validate` pass.
-- The end-to-end deployment on Azure has not been executed yet. A live demonstration can be provided on request.
+- `terraform init`, `terraform validate` and `terraform plan` pass.
+- The full deployment was executed on Azure (region `swedencentral`): k3s cluster with 1 control plane and 1 worker, both nodes Ready, Argo CD installed, `web-app` Synced and Healthy with 2 running replicas, application reachable in the browser, GitOps scaling test passed.
+- The environment was destroyed after the test.
