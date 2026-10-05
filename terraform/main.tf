@@ -1,9 +1,8 @@
 locals {
-  nodes = {
-    cp-1     = { ip = "10.0.1.10", role = "control-plane" }
-    worker-1 = { ip = "10.0.1.11", role = "worker" }
-    worker-2 = { ip = "10.0.1.12", role = "worker" }
-  }
+  nodes = merge(
+    { cp-1 = { ip = "10.0.1.10", role = "control-plane", size = var.cp_vm_size } },
+    { for i in range(var.worker_count) : "worker-${i + 1}" => { ip = "10.0.1.${11 + i}", role = "worker", size = var.worker_vm_size } }
+  )
 
   cp_private_ip = "10.0.1.10"
 
@@ -96,7 +95,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   computer_name                   = each.key
   location                        = azurerm_resource_group.rg.location
   resource_group_name             = azurerm_resource_group.rg.name
-  size                            = var.vm_size
+  size                            = each.value.size
   admin_username                  = var.admin_username
   disable_password_authentication = true
   network_interface_ids           = [azurerm_network_interface.nic[each.key].id]
@@ -114,7 +113,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   source_image_reference {
     publisher = "Canonical"
     offer     = "ubuntu-24_04-lts"
-    sku       = "server"
+    sku       = var.image_sku
     version   = "latest"
   }
 
